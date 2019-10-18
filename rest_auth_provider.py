@@ -37,9 +37,36 @@ class RestAuthProvider(object):
         self.endpoint = config.endpoint
         self.regLower = config.regLower
         self.config = config
-        
+
         logger.info('Endpoint: %s', self.endpoint)
         logger.info('Enforce lowercase username during registration: %s', self.regLower)
+
+    @defer.inlineCallbacks
+    def check_3pid_auth(self, medium, address, password):
+        logger.info("Called check_3pid_auth Email : %s", address)
+        if medium != "email":
+            defer.returnValue(None)
+
+        data = {'user': {'id': address, 'password': password}}
+        r = yield requests.post(self.endpoint + '/_matrix-internal/identity/v1/check_credentials', json=data)
+        r.raise_for_status()
+        r = r.json()
+        logger.info('Got the auth api Resp : %s', r)
+        if not r["auth"]:
+            reason = "Invalid JSON data returned from REST endpoint"
+            logger.warning(reason)
+            raise RuntimeError(reason)
+
+        auth = r["auth"]
+        if not auth["success"]:
+            logger.info("User not authenticated")
+            defer.returnValue(False)
+
+        user_id = auth['mxid']
+        localpart = user_id.split(":", 1)[0][1:]
+        name = auth["profile"]['display_name']
+        user_id = yield self.register_user(localpart, name, address)
+        defer.returnValue(user_id)
 
     @defer.inlineCallbacks
     def check_password(self, user_id, password):
@@ -130,6 +157,42 @@ class RestAuthProvider(object):
             logger.info("No profile data")
 
         defer.returnValue(True)
+
+    @defer.inlineCallbacks
+    def register_user(self, localpart, name, email_address):
+        """Register a Synapse user, first checking if they exist.
+        Args:
+            localpart (str): Localpart of the user to register on this homeserver.
+            name (str): Full name of the user.
+            email_address (str): Email address of the user.
+        Returns:
+            user_id (str): User ID of the newly registered user.
+        """
+        # Get full user id from localpart
+        user_id = self.account_handler.get_qualified_user_id(localpart)
+
+        if (yield self.account_handler.check_user_exists(user_id)):
+            # exists, authentication complete
+            defer.returnValue(user_id)
+
+        # register an email address if one exists
+        emails = [email_address] if email_address is not None else []
+
+        # create account
+        # check if we're running a version of synapse that supports binding emails
+        # from password providers
+
+        # If Synapse has support, bind emails
+        user_id, access_token = (
+            yield self.account_handler.register(
+                localpart=localpart, displayname=name, emails=emails,
+            )
+        )
+        logger.info(
+            "Registration based on LDAP data was successful: %s",
+            user_id,
+        )
+        defer.returnValue(user_id)
 
     @staticmethod
     def parse_config(config):
